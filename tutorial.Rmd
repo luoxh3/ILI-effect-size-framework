@@ -1,0 +1,1749 @@
+---
+title: "A Step-by-Step Tutorial on the Effect Size Framework for Intensive Longitudinal Interventions"
+author: "Xiaohui Luo"
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+    theme: architect
+    highlight: github
+    toc: true
+    toc_depth: 3
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 8, fig.height = 5, dpi = 150, comment = "#>"
+)
+# Small helpers used only for the inline text of this document.
+fmt <- function(x) sprintf("%.2f", x)
+ci_text <- function(row) {
+  sprintf("%.2f (95%% CrI [%.2f, %.2f])", row$median, row$q2.5, row$q97.5)
+}
+cred_text <- function(row) {
+  if (isTRUE(row$credible_nonzero)) "excludes zero" else "includes zero"
+}
+```
+
+```{r folders, include=FALSE}
+# All input and output paths are relative to the folder of this file.
+dir.create("tables", showWarnings = FALSE)
+```
+
+```{r fn-utils, include=FALSE}
+group_label <- function(group) ifelse(group == 1L, "treatment", "control")
+phase_label <- function(phase) ifelse(phase == 1L, "intervention", "baseline")
+
+write_csv <- function(x, path) {
+  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+  utils::write.csv(x, path, row.names = FALSE, na = "")
+  invisible(path)
+}
+
+save_figure <- function(plot, path, width, height, dpi = 320) {
+  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+  ggplot2::ggsave(path, plot = plot, width = width, height = height,
+                  units = "in", dpi = dpi, bg = "white")
+  invisible(path)
+}
+
+# Posterior point estimate = median; interval = 95% equal-tailed CrI.
+posterior_summary <- function(x) {
+  c(q2.5 = stats::quantile(x, 0.025, na.rm = TRUE, names = FALSE),
+    median = stats::median(x, na.rm = TRUE),
+    q97.5 = stats::quantile(x, 0.975, na.rm = TRUE, names = FALSE))
+}
+
+summarise_draw_matrix <- function(draws, time) {
+  tibble::tibble(
+    time = time,
+    q2.5 = apply(draws, 2, stats::quantile, 0.025, na.rm = TRUE),
+    median = apply(draws, 2, stats::median, na.rm = TRUE),
+    q97.5 = apply(draws, 2, stats::quantile, 0.975, na.rm = TRUE))
+}
+
+paper_theme <- function(base_size = 11) {
+  ggplot2::theme_minimal(base_size = base_size) +
+    ggplot2::theme(
+      panel.grid.minor = ggplot2::element_blank(),
+      legend.position = "top",
+      strip.text = ggplot2::element_text(face = "bold"),
+      plot.title.position = "plot",
+      plot.title = ggplot2::element_text(face = "bold"))
+}
+
+# Panels get an explicit border so plot boundaries and zero lines are clear.
+panel_border_theme <- function() {
+  ggplot2::theme(panel.border = ggplot2::element_rect(
+    color = "grey25", fill = NA, linewidth = 0.6))
+}
+
+log_step <- function(...) {
+  message(format(Sys.time(), "%H:%M:%S"), " | ", paste0(...))
+}
+```
+
+# About this tutorial
+
+This tutorial accompanies the article *Beyond Pre-Post Comparisons: A
+Comprehensive Effect Size Framework for Intensive Longitudinal
+Interventions via Time-Varying Modeling*. It provides a step-by-step
+walk-through of the analyses and results of the article's empirical
+illustration. Although the tutorial works with one concrete dataset, the
+workflow applies directly to other intensive longitudinal intervention
+(ILI) data with similar designs.
+
+The article proposes a comprehensive effect size framework for ILIs,
+built on Bayesian multilevel time-varying autoregressive (TV-AR) models
+within the generalized additive mixed model (GAMM) approach. The
+framework organizes effect sizes along four dimensions: (a) subject
+level (population-average, individual-specific, and between-group), (b)
+parameter type (mean level, autoregressive coefficient, and variance),
+(c) temporal scale (integrated over a phase, evaluated at each time
+point), and (d) study phase (active intervention, post-intervention
+decay). This tutorial demonstrates how the intervention effect size
+metrics of the framework are estimated and interpreted in practice.
+
+**The data.** The empirical illustration builds on an ILI study with an
+intervention group (n = 66) and a control group (n = 57). Both groups
+completed an 8-day pre-intervention phase and a 20-day intervention
+phase of ecological momentary assessment, and the intervention group
+additionally received a daily guided mindfulness exercise during the
+intervention phase. The target variable is momentary negative affect,
+scored 0 to 100.
+
+Accurate estimation of multilevel TV-AR models is demanding in terms of
+sample size, and previous simulation work recommends at least 100
+participants per group. We therefore fitted the models to the original
+data first and then used the estimated posterior as a generating model
+for a larger simulated dataset with 150 participants per group,
+preserving the design and the missingness structure of the original
+study. The present tutorial analyzes this simulated dataset exactly as
+one would analyze a freshly collected one. The complete code covering
+the original-data estimation, the data generation, and the re-estimation
+on the simulated data is documented in the complete analysis code
+document, available together with this tutorial at
+<https://github.com/luoxh3/ILI-effect-size-framework>.
+
+**Structure of the tutorial.** The analysis proceeds in four steps.
+
+-   **Step 1. Descriptive analysis.** Load the data and inspect the
+    observed series.
+-   **Step 2. Data preparation.** Standardize the series and build the
+    model input matrices.
+-   **Step 3. Model fitting.** Fit the multilevel AR(1) model and the
+    multilevel TV-AR model, then check convergence and parameter
+    estimates.
+-   **Step 4. Effect size estimation and results.** Compute all effect
+    size metrics of the framework and present the results.
+
+# 1. Setup
+
+We first attach the packages used directly in this document. The
+analysis functions also call `cmdstanr`, `posterior`, `mgcv`, `tidyr`,
+`purrr`, and `tibble` through their namespaces.
+
+```{r packages}
+library(dplyr)     # data wrangling
+library(ggplot2)   # figures
+library(knitr)     # formatted tables
+```
+
+**The time grid.** The study scheduled four assessments per day at
+4-hour intervals. To obtain equally spaced intervals suitable for
+discrete-time autoregressive modeling, two additional missing
+observations are inserted into the overnight window of each day, so that
+each day comprises six 4-hour blocks of which beeps 1 to 4 are scheduled
+assessments. The pre-intervention phase spans grid time points 1 to 48
+and the intervention phase spans grid time points 49 to 168.
+
+```{r cfg-design}
+BEEPS_PER_DAY   <- 6L    # grid slots per day; beeps 5-6 are structural gaps
+AUTHENTIC_BEEPS <- 1:4   # beeps at which responses could actually be given
+BASELINE_DAYS   <- 8L    # days 1..8   -> baseline phase  (t = 1..48)
+TOTAL_DAYS      <- 28L   # days 9..28  -> intervention    (t = 49..168)
+BASELINE_T      <- seq_len(BASELINE_DAYS * BEEPS_PER_DAY)          # 1..48
+INTERVENTION_T  <- seq.int(max(BASELINE_T) + 1L,
+                           TOTAL_DAYS * BEEPS_PER_DAY)             # 49..168
+```
+
+**MCMC settings.** All models are estimated with the settings below.
+
+```{r cfg-mcmc}
+# 2 chains run in parallel with 5000 iterations each; the first 1000 per
+# chain are discarded as burn-in, leaving 2 x 4000 = 8000 posterior draws.
+# All sampler diagnostics are recorded, but the convergence requirement is
+# Rhat < 1.01 for every free parameter.
+FORMAL_CONFIG <- list(
+  chains = 2L, parallel_chains = 2L,
+  iter_warmup = 1000L, iter_sampling = 4000L,
+  adapt_delta = 0.99, max_treedepth = 15L,
+  refresh = 100L, seed = 20260817L,
+  phi_max = 0.95,          # upper bound of |phi| via the tanh link
+  k_population = 20L,      # basis size, population-level smooths
+  k_individual = 10L,      # basis size, individual-level smooths
+  synthetic_n_per_group = 150L,
+  rhat_limit = 1.01,
+  model_version = "tutorial_single_outcome_v3"
+)
+```
+
+**Plotting style.** All figures in this tutorial share one style, which
+matches the figures of the article.
+
+```{r fig-style}
+# Shared plotting style: output folder, panel labels, colors, time axis, theme.
+FIG_DIR <- "figures"
+dir.create(FIG_DIR, showWarnings = FALSE)
+METRICS <- c("mean_standardized", "ar_difference", "local_variance_log_ratio")
+panel_labels <- c(
+  mean_standardized = "(a) Mean level",
+  ar_difference = "(b) Autoregressive coefficient",
+  local_variance_log_ratio = "(c) Variance")
+CAT_LABELS <- c(neg = "Negative (95% CrI excludes 0)",
+                pos = "Positive (95% CrI excludes 0)",
+                ns  = "Near zero (95% CrI includes 0)")
+CAT_COLORS <- c(neg = "#3498DB", pos = "#E67E22", ns = "gray40")
+tp_of <- function(t) t - max(BASELINE_T)          # grid t -> 1..120
+TP_BREAKS <- c(1, 30, 60, 90, 120)
+X_LAB <- expression("Time point within the intervention phase (" * italic(T)[2] == 120 * ")")
+
+theme_paper <- function(base_size = 10) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      panel.grid.major = element_line(color = "grey78", linetype = "dotted",
+                                      linewidth = 0.35),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(color = "grey30", fill = NA,
+                                  linewidth = 0.45),
+      strip.text = element_text(face = "bold", hjust = 0,
+                                size = base_size, color = "black"),
+      strip.background = element_blank(),
+      axis.text = element_text(color = "black"),
+      axis.title = element_text(color = "black"),
+      axis.ticks = element_line(color = "black", linewidth = 0.35),
+      axis.ticks.length = unit(2.5, "pt"),
+      legend.position = "bottom",
+      legend.justification = "center",
+      plot.background = element_rect(fill = "white", color = NA))
+}
+```
+
+# 2. Step 1: Descriptive analysis
+
+## 2.1 Loading the data
+
+The dataset is one long-format CSV in which the assessment time points
+are nested within persons, so each row holds one time point of one
+person. The columns are `id`, `group` (1 = intervention, 0 = control),
+`day`, `beep`, `t` (the grid time point), `phase` (1 = intervention
+phase), and `value`, the negative affect score on the 0 to 100 scale
+(`NA` when the time point was not answered).
+
+```{r load-data}
+# Load the simulated dataset and flag the scheduled assessment slots.
+synthetic <- read.csv("simulated_data.csv") |>
+  # beeps 5 and 6 are the inserted overnight blocks
+  dplyr::mutate(authentic_slot = beep %in% AUTHENTIC_BEEPS)
+```
+
+## 2.2 Descriptive overview
+
+We compute a descriptive overview per group and phase over the scheduled
+assessments.
+
+```{r overview}
+overview <- synthetic |>
+  dplyr::filter(authentic_slot) |>
+  dplyr::group_by(group, phase) |>
+  dplyr::summarise(persons = dplyr::n_distinct(id),
+                   observed = sum(!is.na(value)),
+                   missing_rate = mean(is.na(value)),
+                   observed_mean = mean(value, na.rm = TRUE),
+                   observed_sd = stats::sd(value, na.rm = TRUE),
+                   .groups = "drop") |>
+  dplyr::mutate(group = group_label(group), phase = phase_label(phase))
+kable(overview, digits = 3,
+      caption = "Descriptive overview by group and phase.")
+```
+
+## 2.3 Observed group trajectories
+
+Next we plot the observed group means at every scheduled time point to
+inspect the raw series of the two groups. The dashed line marks the
+intervention onset.
+
+```{r fig-observed, results='hide'}
+# Observed group means at every scheduled time point, one panel per group
+# with its own vertical scale. The dashed line marks the intervention onset.
+sim_data <- read.csv("simulated_data.csv") |>
+  dplyr::mutate(scheduled = beep %in% AUTHENTIC_BEEPS)
+observed_means <- sim_data |>
+  dplyr::filter(scheduled, !is.na(value)) |>
+  dplyr::group_by(group, t) |>
+  dplyr::summarise(mean = mean(value), .groups = "drop") |>
+  dplyr::mutate(panel = factor(
+    ifelse(group == 1, "(a) Intervention group", "(b) Control group"),
+    levels = c("(a) Intervention group", "(b) Control group")))
+p_obs <- ggplot(observed_means, aes(t, mean, color = panel)) +
+  geom_vline(xintercept = max(BASELINE_T) + 0.5, linetype = "dashed",
+             color = "grey40") +
+  geom_line(linewidth = 0.45, alpha = 0.9, show.legend = FALSE) +
+  geom_point(size = 0.7, alpha = 0.9, show.legend = FALSE) +
+  scale_color_manual(values = c("(a) Intervention group" = "#E67E22",
+                                "(b) Control group" = "#3498DB")) +
+  scale_x_continuous(breaks = c(1, seq(24, 168, 24))) +
+  facet_wrap(~panel, ncol = 1, scales = "free_y") +
+  labs(x = "Time point (the dashed line marks the intervention onset)",
+       y = "Observed mean of negative affect") +
+  theme_paper()
+ggsave(file.path(FIG_DIR, "figure_observed.png"), p_obs, width = 9,
+       height = 5.6, dpi = 320, bg = "white")
+```
+
+```{r observed-show, echo=FALSE, out.width="95%"}
+knitr::include_graphics(file.path(FIG_DIR, "figure_observed.png"))
+```
+
+# 3. Step 2: Data preparation
+
+## 3.1 One common standardization
+
+All series are z-standardized with one centre and one scale computed
+from the pooled scheduled baseline observations of both groups, and all
+reported parameters are transformed back to the 0 to 100 scale
+afterwards.
+
+```{r fn-scaling}
+# compute_common_scaling(): the shared z-standardization constants.
+#   data : long-format data with columns `phase`, `authentic_slot`, `value`
+#   Returns list(center, scale), computed from the pooled scheduled baseline
+#   observations of both groups.
+compute_common_scaling <- function(data) {
+  x <- data$value[data$phase == 0L & data$authentic_slot]
+  scale <- stats::sd(x, na.rm = TRUE)
+  stopifnot("invalid baseline SD" = is.finite(scale) && scale > 0)
+  list(center = mean(x, na.rm = TRUE), scale = scale)
+}
+```
+
+```{r scaling-run}
+# Common z-standardization constants from the pooled baseline observations.
+scaling <- compute_common_scaling(synthetic)
+unlist(scaling)
+```
+
+## 3.2 Person-by-time matrices
+
+Each of the four model fits (two groups by two phases) receives a
+persons-by-time matrix on the z scale. Missing cells stay `NA` at this
+stage.
+
+```{r fn-phase-matrix}
+# prepare_phase_matrix(): the persons-by-time input matrix for one model.
+#   data    : long-format data frame
+#   group   : 0 = control, 1 = intervention
+#   phase   : 0 = baseline, 1 = intervention phase
+#   scaling : list(center, scale) from compute_common_scaling()
+#   Returns a list with the person ids, the grid time points, and the
+#   persons-by-time outcome matrix on the z scale (missing cells stay NA).
+prepare_phase_matrix <- function(data, group, phase, scaling) {
+  rows <- data |>
+    dplyr::filter(.data$group == .env$group, .data$phase == .env$phase) |>
+    dplyr::arrange(.data$id, .data$t)
+  ids <- sort(unique(rows$id))
+  times <- sort(unique(rows$t))
+  y_raw <- matrix(rows$value, nrow = length(ids), ncol = length(times),
+                  byrow = TRUE)
+  list(ids = ids, t_global = times,
+       y = (y_raw - scaling$center) / scaling$scale,
+       scaling = scaling, group = group, phase = phase)
+}
+```
+
+```{r phase-matrices}
+# Persons-by-time input matrix for each group and phase.
+phase_matrices <- list()
+for (group in c(0L, 1L)) for (phase in c(0L, 1L)) {
+  name <- paste(group_label(group), phase_label(phase), sep = "_")
+  phase_matrices[[name]] <- prepare_phase_matrix(synthetic, group, phase,
+                                                 scaling)
+}
+```
+
+# 4. Step 3: Model fitting and parameter estimation
+
+## 4.1 The two Stan models
+
+Two models are fitted per group. The pre-intervention phase is described
+by a multilevel time-invariant AR(1) model, in which each person has
+their own intercept, autoregressive coefficient, and innovation
+variance, and these person-specific parameters follow a multivariate
+normal distribution across persons. The intervention phase is described
+by a multilevel TV-AR model, in which both the intercept and the
+autoregressive coefficient additionally vary smoothly over time, at the
+population level and person-specifically. The full specification of the
+multilevel TV-AR model is given in Equations 16 to 22 of the article.
+
+**Missing data.** Missing observations, including the overnight blocks,
+are assumed to be missing at random and are treated as latent variables
+in the Bayesian estimation. At each MCMC iteration, the missing values
+are inferred from the observed data and the current draws of the model
+parameters. In the Stan programs below this is implemented by rolling
+the AR recursion forward across the missing time points, which gives the
+exact distribution of each observation given the previous observed one.
+
+**Stan code of the multilevel AR(1) model for the baseline phase.**
+
+```{r stan-baseline}
+baseline_model_code <- "
+// Multilevel time-invariant AR(1) model for the baseline phase.
+
+data {
+  int<lower=1> Nnum;                            // number of persons
+  int<lower=2> Tnum;                            // number of grid time points
+  real<lower=0, upper=1> phi_max;               // upper bound of |phi| (tanh link)
+  matrix[Nnum, Tnum] y;                         // observed series (z scale; 0 where missing)
+  array[Nnum, Tnum] int<lower=0, upper=1> is_observed;  // 1 = observed, 0 = missing
+}
+
+parameters {
+  // Population means: gamma[1] = intercept, gamma[2] = raw (unbounded) AR
+  // coefficient, gamma[3] = log innovation variance.
+  vector[3] gamma;
+  matrix[Nnum, 3] u_raw;                        // person random effects, non-centered
+  cholesky_factor_corr[3] L_Omega;              // correlation of the random effects
+  vector<lower=0>[3] tau;                       // SDs of the random effects
+}
+
+model {
+  // Person random effects u: scale and correlate the standard-normal u_raw.
+  matrix[Nnum, 3] u = diag_post_multiply(u_raw * L_Omega', tau);
+
+  // Weakly informative priors (the outcome is on a common z scale).
+  gamma[1] ~ normal(0, 1);
+  gamma[2] ~ normal(atanh(0.25 / phi_max), 0.50);
+  gamma[3] ~ normal(log(square(0.50)), 1);
+  to_vector(u_raw) ~ std_normal();
+  L_Omega ~ lkj_corr_cholesky(2);
+  tau[1] ~ normal(0, 0.75);
+  tau[2] ~ normal(0, 0.35);
+  tau[3] ~ normal(0, 0.75);
+
+  // Likelihood, person by person.
+  for (i in 1:Nnum) {
+    real alpha_i = gamma[1] + u[i, 1];                    // person intercept
+    real phi_i = phi_max * tanh(gamma[2] + u[i, 2]);      // person AR coefficient
+    real innovation_variance = exp(gamma[3] + u[i, 3]);   // person innovation variance
+    real attractor_i = alpha_i / (1 - phi_i);             // person stationary mean
+    real stationary_variance = innovation_variance / (1 - square(phi_i));
+    int previous_time = 0;                                // last observed time point
+    real previous_y = 0;                                  // last observed value
+
+    // Walk through the grid and evaluate only the observed time points.
+    // Missing time points (overnight blocks and skipped assessments) are
+    // latent: the AR recursion is applied `gap` times between two observed
+    // points, which gives the exact Gaussian distribution of the later
+    // observation given the earlier one.
+    for (t in 1:Tnum) {
+      if (is_observed[i, t] == 1) {
+        if (previous_time == 0) {
+          // First observed point: use the stationary distribution.
+          y[i, t] ~ normal(attractor_i, sqrt(stationary_variance));
+        } else {
+          int gap = t - previous_time;                    // steps since last observation
+          real phi_gap = pow(phi_i, gap);                 // AR effect over the gap
+          real transition_mean = attractor_i + phi_gap * (previous_y - attractor_i);
+          real transition_variance = innovation_variance
+            * (1 - pow(phi_i, 2 * gap)) / (1 - square(phi_i));
+          y[i, t] ~ normal(transition_mean, sqrt(transition_variance));
+        }
+        previous_time = t;
+        previous_y = y[i, t];
+      }
+    }
+  }
+}
+
+generated quantities {
+  // Quantities saved for the post-processing in R.
+  matrix[Nnum, 3] u = diag_post_multiply(u_raw * L_Omega', tau);
+  corr_matrix[3] R_Omega = multiply_lower_tri_self_transpose(L_Omega);
+  cov_matrix[3] Sigma_u = quad_form_diag(R_Omega, tau);   // random-effect covariance
+}
+"
+writeLines(baseline_model_code, "ar1_baseline_missing.stan")
+```
+
+**Stan code of the multilevel TV-AR model for the intervention phase**,
+which allows both the intercept and the AR coefficient to vary over
+time.
+
+```{r stan-tvar}
+tvar_model_code <- "
+// Multilevel time-varying AR (TV-AR) model for the intervention phase:
+// both the intercept and the AR coefficient vary smoothly over time.
+
+data {
+  int<lower=1> Nnum;                            // number of persons
+  int<lower=2> Tnum;                            // number of grid time points
+  real<lower=0, upper=1> phi_max;               // upper bound of |phi| (tanh link)
+  matrix[Nnum, Tnum] y;                         // observed series (z scale; 0 where missing)
+  array[Nnum, Tnum] int<lower=0, upper=1> is_observed;  // 1 = observed, 0 = missing
+
+  // Population-level spline bases for the time-varying intercept and AR
+  // coefficient. Each smooth is split into a penalized (wiggly) part Xr with
+  // Ks columns and a fixed (linear) part Xf with Kf columns; see the R
+  // function prepare_design_matrices().
+  int<lower=1> Ks_alpha;
+  matrix[Tnum, Ks_alpha] Xr_alpha;
+  int<lower=1> Kf_alpha;
+  matrix[Tnum, Kf_alpha] Xf_alpha;
+  int<lower=1> Ks_phi;
+  matrix[Tnum, Ks_phi] Xr_phi;
+  int<lower=1> Kf_phi;
+  matrix[Tnum, Kf_phi] Xf_phi;
+
+  // Individual-level spline bases (smaller k), same structure as above.
+  int<lower=1> Ks_alpha_ind;
+  matrix[Tnum, Ks_alpha_ind] Xr_alpha_ind;
+  int<lower=1> Kf_alpha_ind;
+  matrix[Tnum, Kf_alpha_ind] Xf_alpha_ind;
+  int<lower=1> Ks_phi_ind;
+  matrix[Tnum, Ks_phi_ind] Xr_phi_ind;
+  int<lower=1> Kf_phi_ind;
+  matrix[Tnum, Kf_phi_ind] Xf_phi_ind;
+}
+
+parameters {
+  // Time-invariant part, as in the baseline model: population means
+  // (intercept, raw AR, log innovation variance) and correlated person
+  // random effects.
+  vector[3] gamma;
+  matrix[Nnum, 3] u_raw;
+  cholesky_factor_corr[3] L_Omega;
+  vector<lower=0>[3] tau;
+
+  // Population-level smooths (non-centered): a_raw_* are the standardized
+  // penalized coefficients, tau_s_* their smoothing SD (how wiggly the curve
+  // may be), and a0_* the unpenalized linear part.
+  real<lower=0> tau_s_alpha;
+  vector[Kf_alpha] a0_alpha;
+  vector[Ks_alpha] a_raw_alpha;
+  real<lower=0> tau_s_phi;
+  vector[Kf_phi] a0_phi;
+  vector[Ks_phi] a_raw_phi;
+
+  // Individual-level smooth deviations, one row per person: tau_s_*_ind
+  // scales the penalized (nonlinear) part and tau_l_*_ind the linear part.
+  real<lower=0> tau_s_alpha_ind;
+  real<lower=0> tau_l_alpha_ind;
+  matrix[Nnum, Kf_alpha_ind] a0_raw_alpha_ind;
+  matrix[Nnum, Ks_alpha_ind] a_raw_alpha_ind;
+  real<lower=0> tau_s_phi_ind;
+  real<lower=0> tau_l_phi_ind;
+  matrix[Nnum, Kf_phi_ind] a0_raw_phi_ind;
+  matrix[Nnum, Ks_phi_ind] a_raw_phi_ind;
+}
+
+model {
+  // ---- Assemble the person-by-time parameter surfaces -----------------------
+  // Person random effects and scaled spline coefficients.
+  matrix[Nnum, 3] u = diag_post_multiply(u_raw * L_Omega', tau);
+  vector[Ks_alpha] a_alpha = tau_s_alpha * a_raw_alpha;
+  vector[Ks_phi] a_phi = tau_s_phi * a_raw_phi;
+  matrix[Nnum, Ks_alpha_ind] a_alpha_ind = tau_s_alpha_ind * a_raw_alpha_ind;
+  matrix[Nnum, Kf_alpha_ind] a0_alpha_ind = tau_l_alpha_ind * a0_raw_alpha_ind;
+  matrix[Nnum, Ks_phi_ind] a_phi_ind = tau_s_phi_ind * a_raw_phi_ind;
+  matrix[Nnum, Kf_phi_ind] a0_phi_ind = tau_l_phi_ind * a0_raw_phi_ind;
+
+  // Population time-varying curves: basis matrix times coefficients.
+  row_vector[Tnum] pop_alpha_smooth = (Xr_alpha * a_alpha + Xf_alpha * a0_alpha)';
+  row_vector[Tnum] pop_phi_smooth = (Xr_phi * a_phi + Xf_phi * a0_phi)';
+
+  // Person i, time t intercept: population mean + person random effect
+  // + population smooth + person smooth deviation. Same structure for phi.
+  matrix[Nnum, Tnum] alpha_t = rep_matrix(gamma[1], Nnum, Tnum)
+    + rep_matrix(u[, 1], Tnum) + rep_matrix(pop_alpha_smooth, Nnum)
+    + a_alpha_ind * Xr_alpha_ind' + a0_alpha_ind * Xf_alpha_ind';
+  matrix[Nnum, Tnum] phi_raw_t = rep_matrix(gamma[2], Nnum, Tnum)
+    + rep_matrix(u[, 2], Tnum) + rep_matrix(pop_phi_smooth, Nnum)
+    + a_phi_ind * Xr_phi_ind' + a0_phi_ind * Xf_phi_ind';
+  // Bound the AR coefficient to (-phi_max, phi_max) via the tanh link.
+  matrix[Nnum, Tnum] phi_t = phi_max * tanh(phi_raw_t);
+
+  // ---- Priors ---------------------------------------------------------------
+  // Weakly informative priors (the outcome is on a common z scale).
+  gamma[1] ~ normal(0, 1);
+  gamma[2] ~ normal(atanh(0.25 / phi_max), 0.50);
+  gamma[3] ~ normal(log(square(0.50)), 1);
+  to_vector(u_raw) ~ std_normal();
+  L_Omega ~ lkj_corr_cholesky(2);
+  tau[1] ~ normal(0, 0.75);
+  tau[2] ~ normal(0, 0.35);
+  tau[3] ~ normal(0, 0.75);
+
+  // Population smooths.
+  a_raw_alpha ~ std_normal();
+  a0_alpha ~ normal(0, 0.50);
+  tau_s_alpha ~ normal(0, 0.50);
+  a_raw_phi ~ std_normal();
+  a0_phi ~ normal(0, 0.25);
+  tau_s_phi ~ normal(0, 0.25);
+
+  // Individual smooth deviations.
+  to_vector(a_raw_alpha_ind) ~ std_normal();
+  to_vector(a0_raw_alpha_ind) ~ std_normal();
+  tau_s_alpha_ind ~ normal(0, 0.50);
+  tau_l_alpha_ind ~ normal(0, 0.50);
+  to_vector(a_raw_phi_ind) ~ std_normal();
+  to_vector(a0_raw_phi_ind) ~ std_normal();
+  tau_s_phi_ind ~ normal(0, 0.20);
+  tau_l_phi_ind ~ normal(0, 0.20);
+
+  // ---- Likelihood -----------------------------------------------------------
+  // As in the baseline model, only observed time points enter the likelihood.
+  // Missing time points are latent: between two observed points the AR
+  // recursion is applied step by step (now with time-specific alpha_t and
+  // phi_t), accumulating the mean and variance, which gives the exact
+  // Gaussian distribution of the later observation given the earlier one.
+  for (i in 1:Nnum) {
+    real innovation_variance = exp(gamma[3] + u[i, 3]);
+    int previous_time = 0;                                // last observed time point
+    real previous_y = 0;                                  // last observed value
+
+    for (t in 1:Tnum) {
+      if (is_observed[i, t] == 1) {
+        real transition_mean;
+        real transition_variance;
+        if (previous_time == 0) {
+          // Before the first observation: start from the local stationary
+          // distribution at t = 1 and roll it forward to time t.
+          transition_mean = alpha_t[i, 1] / (1 - phi_t[i, 1]);
+          transition_variance = innovation_variance / (1 - square(phi_t[i, 1]));
+          if (t > 1) {
+            for (k in 2:t) {
+              transition_mean = alpha_t[i, k] + phi_t[i, k] * transition_mean;
+              transition_variance = square(phi_t[i, k]) * transition_variance
+                + innovation_variance;
+            }
+          }
+        } else {
+          // Roll the AR recursion forward from the last observed value.
+          transition_mean = previous_y;
+          transition_variance = 0;
+          for (k in (previous_time + 1):t) {
+            transition_mean = alpha_t[i, k] + phi_t[i, k] * transition_mean;
+            transition_variance = square(phi_t[i, k]) * transition_variance
+              + innovation_variance;
+          }
+        }
+        y[i, t] ~ normal(transition_mean, sqrt(transition_variance));
+        previous_time = t;
+        previous_y = y[i, t];
+      }
+    }
+  }
+}
+
+generated quantities {
+  // Quantities saved for the post-processing in R.
+  matrix[Nnum, 3] u = diag_post_multiply(u_raw * L_Omega', tau);
+  vector[Ks_alpha] a_alpha = tau_s_alpha * a_raw_alpha;
+  vector[Ks_phi] a_phi = tau_s_phi * a_raw_phi;
+  matrix[Nnum, Ks_alpha_ind] a_alpha_ind = tau_s_alpha_ind * a_raw_alpha_ind;
+  matrix[Nnum, Kf_alpha_ind] a0_alpha_ind = tau_l_alpha_ind * a0_raw_alpha_ind;
+  matrix[Nnum, Ks_phi_ind] a_phi_ind = tau_s_phi_ind * a_raw_phi_ind;
+  matrix[Nnum, Kf_phi_ind] a0_phi_ind = tau_l_phi_ind * a0_raw_phi_ind;
+  corr_matrix[3] R_Omega = multiply_lower_tri_self_transpose(L_Omega);
+  cov_matrix[3] Sigma_u = quad_form_diag(R_Omega, tau);   // random-effect covariance
+}
+"
+writeLines(tvar_model_code, "tvar_intervention_missing.stan")
+```
+
+## 4.2 Spline bases and Stan data
+
+The time-varying curves of the TV-AR model are built from penalized
+thin-plate spline bases. `prepare_design_matrices()` constructs these
+bases and `make_stan_data()` bundles them with the outcome matrix into
+the data list passed to Stan.
+
+```{r fn-splines}
+# prepare_design_matrices(): penalized thin-plate spline bases for the
+# multilevel TV-AR model, at two resolutions.
+#   Tnum         : number of time points
+#   k_population : basis size of the population-level smooths
+#   k_individual : basis size of the individual-level smooths
+#   Returns, for the intercept (alpha) and the AR coefficient (phi) at both
+#   levels, a penalized basis Xr (Tnum x Ks, the wiggly part) and a fixed
+#   basis Xf (Tnum x Kf, the linear part).
+prepare_design_matrices <- function(Tnum, k_population, k_individual) {
+  x <- seq(0, 1, length.out = Tnum)
+  make_basis <- function(k, label) {
+    # Build one penalized thin-plate spline basis. absorb.cons = TRUE centres
+    # the smooth (its fitted values sum to zero over time), so the smooth only
+    # captures deviations around the overall level and is not confounded with
+    # the intercept. smooth2random() then splits the basis into a fixed
+    # (linear) part Xf and a penalized (wiggly) part Xr, whose coefficients
+    # act as random effects in Stan.
+    smooth <- mgcv::smoothCon(
+      mgcv::s(x, k = min(as.integer(k), Tnum - 2L), bs = "tp"),
+      data = data.frame(x = x), absorb.cons = TRUE)[[1]]
+    random <- mgcv::smooth2random(smooth, label, type = 2)
+    list(Xr = unname(as.matrix(random$rand[[1]])),
+         Xf = unname(as.matrix(random$Xf)))
+  }
+  list(alpha = make_basis(k_population, "alpha_pop"),
+       phi = make_basis(k_population, "phi_pop"),
+       alpha_ind = make_basis(k_individual, "alpha_ind"),
+       phi_ind = make_basis(k_individual, "phi_ind"))
+}
+```
+
+```{r fn-stan-data}
+# compile_stan_models(): compile the two Stan programs (cached after the
+# first compilation). Returns list(baseline, intervention).
+compile_stan_models <- function() {
+  list(
+    baseline = cmdstanr::cmdstan_model(
+      "ar1_baseline_missing.stan",
+      force_recompile = FALSE, quiet = TRUE),
+    intervention = cmdstanr::cmdstan_model(
+      "tvar_intervention_missing.stan",
+      force_recompile = FALSE, quiet = TRUE))
+}
+
+# make_stan_data(): bundle one phase matrix (and, for the TV-AR model, the
+# spline bases) into the data list passed to Stan.
+#   phase_matrix : output of prepare_phase_matrix()
+#   design       : output of prepare_design_matrices(); NULL for the baseline
+#   Missing cells are set to 0 and flagged by the indicator `is_observed`,
+#   which tells Stan which time points enter the likelihood.
+make_stan_data <- function(phase_matrix, design = NULL) {
+  y <- phase_matrix$y
+  observed <- !is.na(y)
+  y[!observed] <- 0   # placeholder; is_observed marks these cells as missing
+  out <- list(Nnum = nrow(y), Tnum = ncol(y),
+              phi_max = FORMAL_CONFIG$phi_max, y = unname(y),
+              is_observed = unname(matrix(as.integer(observed),
+                                          nrow(y), ncol(y))))
+  if (!is.null(design)) {
+    out <- c(out, list(
+      Ks_alpha = ncol(design$alpha$Xr), Xr_alpha = design$alpha$Xr,
+      Kf_alpha = ncol(design$alpha$Xf), Xf_alpha = design$alpha$Xf,
+      Ks_phi = ncol(design$phi$Xr), Xr_phi = design$phi$Xr,
+      Kf_phi = ncol(design$phi$Xf), Xf_phi = design$phi$Xf,
+      Ks_alpha_ind = ncol(design$alpha_ind$Xr), Xr_alpha_ind = design$alpha_ind$Xr,
+      Kf_alpha_ind = ncol(design$alpha_ind$Xf), Xf_alpha_ind = design$alpha_ind$Xf,
+      Ks_phi_ind = ncol(design$phi_ind$Xr), Xr_phi_ind = design$phi_ind$Xr,
+      Kf_phi_ind = ncol(design$phi_ind$Xf), Xf_phi_ind = design$phi_ind$Xf))
+  }
+  out
+}
+```
+
+## 4.3 Fitting the four models
+
+`fit_phase_model()` does three things. It fits one group-by-phase model
+with the MCMC settings defined in the Setup section, it writes the fitted model and its
+convergence diagnostics to the model folder, and it loads a stored fit
+from disk instead of re-sampling whenever a fit with the same settings
+already exists.
+
+```{r fn-fit-model}
+# fit_phase_model(): fit one group-by-phase model.
+#   phase_matrix : output of prepare_phase_matrix()
+#   compiled     : output of compile_stan_models()
+#   out_dir      : output folder; the fit is stored under models/<group>_<phase>
+#   seed_offset  : added to the base seed so every model has its own seed
+#   Returns list(fit, meta, diagnostics). If the model folder already holds a
+#   fit produced with the same settings, that fit is loaded from disk instead
+#   of being re-sampled.
+fit_phase_model <- function(phase_matrix, compiled, out_dir, seed_offset) {
+  label <- paste(group_label(phase_matrix$group),
+                 phase_label(phase_matrix$phase), sep = "_")
+  model_dir <- file.path(out_dir, "models", label)
+  csv_dir <- file.path(model_dir, "cmdstan_csv")
+  dir.create(csv_dir, recursive = TRUE, showWarnings = FALSE)
+  # Settings fingerprint used to decide whether a stored fit can be re-used.
+  signature <- paste(unlist(FORMAL_CONFIG[c(
+    "model_version", "chains", "iter_warmup", "iter_sampling", "adapt_delta",
+    "max_treedepth", "phi_max", "k_population", "k_individual")]),
+    collapse = "|")
+  fit_path <- file.path(model_dir, "fit_object.rds")
+  signature_path <- file.path(model_dir, "settings_signature.txt")
+
+  # The TV-AR model additionally needs the spline bases.
+  design <- if (phase_matrix$phase == 1L) {
+    prepare_design_matrices(ncol(phase_matrix$y),
+                            FORMAL_CONFIG$k_population,
+                            FORMAL_CONFIG$k_individual)
+  }
+  phase_matrix$design <- design
+  saveRDS(phase_matrix, file.path(model_dir, "model_metadata.rds"),
+          compress = "xz")
+
+  reusable <- file.exists(fit_path) && file.exists(signature_path) &&
+    identical(readLines(signature_path, warn = FALSE), signature)
+  if (reusable) {
+    fit <- readRDS(fit_path)
+    reusable <- all(file.exists(fit$output_files()))
+  }
+  if (!reusable) {
+    log_step(label, " | formal MCMC started")
+    model <- if (phase_matrix$phase == 0L) compiled$baseline else
+      compiled$intervention
+    fit <- model$sample(
+      data = make_stan_data(phase_matrix, design),
+      seed = FORMAL_CONFIG$seed + seed_offset,
+      chains = FORMAL_CONFIG$chains,
+      parallel_chains = FORMAL_CONFIG$parallel_chains,
+      iter_warmup = FORMAL_CONFIG$iter_warmup,
+      iter_sampling = FORMAL_CONFIG$iter_sampling,
+      adapt_delta = FORMAL_CONFIG$adapt_delta,
+      max_treedepth = FORMAL_CONFIG$max_treedepth,
+      init = 0.1, refresh = FORMAL_CONFIG$refresh,
+      save_warmup = FALSE, output_dir = csv_dir)
+    saveRDS(fit, fit_path)
+    writeLines(signature, signature_path)
+  } else {
+    log_step(label, " | re-using cached fit")
+  }
+  diagnostics <- export_diagnostics(fit, phase_matrix$phase, model_dir)
+  log_step(label, " | diagnostics: ", diagnostics$status)
+  list(fit = fit, meta = phase_matrix, diagnostics = diagnostics)
+}
+```
+
+```{r fn-diagnostics, include=FALSE}
+# free_parameter_names(): all free parameter blocks of one model, used for
+# the convergence check (phase: 0 = baseline AR(1), 1 = TV-AR).
+free_parameter_names <- function(phase) {
+  if (phase == 0L) c("gamma", "u_raw", "L_Omega", "tau") else
+    c("gamma", "u_raw", "L_Omega", "tau", "tau_s_alpha", "a0_alpha",
+      "a_raw_alpha", "tau_s_phi", "a0_phi", "a_raw_phi",
+      "tau_s_alpha_ind", "tau_l_alpha_ind", "a0_raw_alpha_ind",
+      "a_raw_alpha_ind", "tau_s_phi_ind", "tau_l_phi_ind",
+      "a0_raw_phi_ind", "a_raw_phi_ind")
+}
+
+# key_parameter_names(): the population-level parameters shown in the
+# trace plots.
+key_parameter_names <- function(phase) {
+  if (phase == 0L) c("gamma", "tau") else
+    c("gamma", "tau", "tau_s_alpha", "tau_s_phi",
+      "tau_s_alpha_ind", "tau_l_alpha_ind", "tau_s_phi_ind", "tau_l_phi_ind")
+}
+```
+
+```{r fn-traceplot, include=FALSE}
+# save_trace_plot(): trace plot of the key population-level parameters.
+#   fit / phase / path : fitted model, phase code, output file
+save_trace_plot <- function(fit, phase, path) {
+  x <- posterior::as_draws_df(fit$draws(variables = key_parameter_names(phase))) |>
+    as.data.frame() |>
+    tidyr::pivot_longer(cols = -dplyr::starts_with("."),
+                        names_to = "variable", values_to = "value") |>
+    dplyr::mutate(variable = factor(.data$variable,
+                                    levels = unique(.data$variable)))
+  p <- ggplot2::ggplot(x, ggplot2::aes(.data$.iteration, .data$value,
+                                       color = factor(.data$.chain))) +
+    ggplot2::geom_line(linewidth = 0.25, alpha = 0.65) +
+    ggplot2::facet_wrap(~variable, scales = "free_y", ncol = 3) +
+    ggplot2::scale_color_manual(values = c("#3498DB", "#E67E22")) +
+    ggplot2::labs(x = "Post-warmup iteration", y = NULL, color = "Chain") +
+    ggplot2::theme_minimal(base_size = 9) +
+    ggplot2::theme(
+      panel.grid.major = ggplot2::element_line(color = "grey78",
+                                               linetype = "dotted",
+                                               linewidth = 0.35),
+      panel.grid.minor = ggplot2::element_blank(),
+      panel.border = ggplot2::element_rect(color = "grey30", fill = NA,
+                                           linewidth = 0.45),
+      strip.text = ggplot2::element_text(face = "bold", hjust = 0,
+                                         color = "black"),
+      strip.background = ggplot2::element_blank(),
+      axis.text = ggplot2::element_text(color = "black"),
+      legend.position = "bottom",
+      legend.justification = "center",
+      plot.background = ggplot2::element_rect(fill = "white", color = NA))
+  save_figure(p, path, 12,
+              max(5, 2.3 * ceiling(length(unique(x$variable)) / 3)))
+}
+```
+
+```{r fn-export}
+# export_diagnostics(): convergence diagnostics of one fitted model.
+#   fit       : cmdstanr fit object
+#   phase     : 0 = baseline, 1 = intervention
+#   model_dir : folder to write the diagnostics into
+#   Computes the 95% CrI, R-hat, and bulk/tail ESS for every free parameter,
+#   writes the full table and a one-row summary, and saves the trace plot.
+#   R-hat < 1.01 for all free parameters is the convergence criterion.
+export_diagnostics <- function(fit, phase, model_dir) {
+  # Per-parameter summary over all free parameters.
+  eti <- posterior::summarise_draws(
+    fit$draws(variables = free_parameter_names(phase)),
+    q2.5 = function(x) stats::quantile(x, 0.025, names = FALSE),
+    median = stats::median,
+    q97.5 = function(x) stats::quantile(x, 0.975, names = FALSE),
+    rhat = posterior::rhat,
+    ess_bulk = posterior::ess_bulk,
+    ess_tail = posterior::ess_tail)
+  write_csv(eti, file.path(model_dir, "all_free_parameter_diagnostics.csv"))
+
+  # One-row summary: the worst R-hat and the smallest ESS across parameters.
+  finite <- function(x) x[is.finite(x)]
+  diagnostics <- tibble::tibble(
+    max_rhat = max(finite(eti$rhat)),
+    min_ess_bulk = min(finite(eti$ess_bulk)),
+    min_ess_tail = min(finite(eti$ess_tail))) |>
+    dplyr::mutate(status = dplyr::if_else(
+      .data$max_rhat < FORMAL_CONFIG$rhat_limit, "pass", "fail_rhat"))
+  write_csv(diagnostics, file.path(model_dir, "sampler_diagnostics.csv"))
+  save_trace_plot(fit, phase, file.path(model_dir, "traceplots.png"))
+  diagnostics
+}
+
+models_usable <- function(fits) {
+  statuses <- vapply(fits, function(x) x$diagnostics$status[[1]], character(1))
+  all(statuses == "pass")
+}
+```
+
+```{r compile, results='hide'}
+# Compile the two Stan programs (cached after the first compilation).
+compiled <- compile_stan_models()
+```
+
+```{r fit-models, results='hide'}
+# Fit (or re-load) the four models: two groups by two phases.
+fits <- list()
+for (name in names(phase_matrices)) {
+  pm <- phase_matrices[[name]]
+  fits[[name]] <- fit_phase_model(pm, compiled, ".",
+                                  seed_offset = 200L + pm$group * 2L + pm$phase)
+}
+```
+
+## 4.4 Convergence check
+
+An R-hat below 1.01 for every free parameter is the primary convergence
+criterion, and we also report the bulk and tail effective sample sizes.
+
+```{r diagnostics-table}
+# One-row convergence summary per model.
+diagnostics <- purrr::imap_dfr(fits, function(x, model) {
+  dplyr::mutate(x$diagnostics, model = model, .before = 1)
+})
+diagnostics |>
+  dplyr::select(model, max_rhat, min_ess_bulk, min_ess_tail) |>
+  kable(digits = 3, caption = "Convergence diagnostics for the four models.")
+```
+
+Trace plots of the key population-level parameters, shown here for the
+intervention group's baseline and intervention-phase models, confirm
+that the two chains mix well.
+
+```{r traceplot-base, echo=FALSE, out.width="95%"}
+knitr::include_graphics("models/treatment_baseline/traceplots.png")
+```
+
+```{r traceplot-tvar, echo=FALSE, out.width="95%"}
+knitr::include_graphics("models/treatment_intervention/traceplots.png")
+```
+
+## 4.5 From raw draws to interpretable parameters
+
+The functions below transform the raw Stan draws into interpretable
+quantities on the 0 to 100 scale, at the population level and per
+person: the intercept, the AR coefficient, the model-implied mean, the
+innovation variance, and the local variance. Two small helpers that
+collect the posterior draws into arrays are loaded silently here; their
+documented code is provided in the supplementary code document.
+
+```{r fn-extract, include=FALSE}
+# extract_stan_array(): pull one Stan variable out of a posterior draws
+# matrix.
+#   draw_matrix : posterior draws (draws x variables)
+#   variable    : variable name in the Stan program
+#   dims        : dimensions of the variable (empty for a scalar)
+#   Returns an array of dimension c(n_draws, dims).
+extract_stan_array <- function(draw_matrix, variable, dims = integer(0)) {
+  columns <- colnames(draw_matrix)
+  if (!length(dims)) return(as.numeric(draw_matrix[, variable]))
+  escaped <- gsub("([][{}()+*^$|\\?.])", "\\\\\\1", variable)
+  selected <- grep(paste0("^", escaped, "\\["), columns, value = TRUE)
+  stopifnot(length(selected) == prod(dims))
+  out <- array(NA_real_, dim = c(nrow(draw_matrix), dims))
+  for (column in selected) {
+    index <- as.integer(strsplit(sub("\\]$", "", sub("^.*\\[", "", column)),
+                                 ",", fixed = TRUE)[[1]])
+    if (length(dims) == 1L) out[, index[1]] <- draw_matrix[, column]
+    if (length(dims) == 2L) out[, index[1], index[2]] <- draw_matrix[, column]
+  }
+  out
+}
+
+# extract_baseline_components() / extract_tvar_components(): collect the
+# posterior draws needed to reconstruct one fitted model into a named list
+# of arrays (n_draws = number of posterior draws).
+extract_baseline_components <- function(model_fit) {
+  N <- length(model_fit$meta$ids)
+  m <- posterior::as_draws_matrix(model_fit$fit$draws(
+    variables = c("gamma", "tau", "u", "Sigma_u")))
+  list(gamma = extract_stan_array(m, "gamma", 3L),
+       tau = extract_stan_array(m, "tau", 3L),
+       u = extract_stan_array(m, "u", c(N, 3L)),
+       Sigma_u = extract_stan_array(m, "Sigma_u", c(3L, 3L)),
+       n_draws = nrow(m))
+}
+
+extract_tvar_components <- function(model_fit) {
+  design <- model_fit$meta$design
+  N <- length(model_fit$meta$ids)
+  m <- posterior::as_draws_matrix(model_fit$fit$draws(variables = c(
+    "gamma", "tau", "u", "Sigma_u", "a_alpha", "a0_alpha", "a_phi", "a0_phi",
+    "a_alpha_ind", "a0_alpha_ind", "a_phi_ind", "a0_phi_ind",
+    "tau_s_alpha_ind", "tau_l_alpha_ind", "tau_s_phi_ind", "tau_l_phi_ind")))
+  list(
+    gamma = extract_stan_array(m, "gamma", 3L),
+    tau = extract_stan_array(m, "tau", 3L),
+    u = extract_stan_array(m, "u", c(N, 3L)),
+    Sigma_u = extract_stan_array(m, "Sigma_u", c(3L, 3L)),
+    a_alpha = extract_stan_array(m, "a_alpha", ncol(design$alpha$Xr)),
+    a0_alpha = extract_stan_array(m, "a0_alpha", ncol(design$alpha$Xf)),
+    a_phi = extract_stan_array(m, "a_phi", ncol(design$phi$Xr)),
+    a0_phi = extract_stan_array(m, "a0_phi", ncol(design$phi$Xf)),
+    a_alpha_ind = extract_stan_array(m, "a_alpha_ind",
+                                     c(N, ncol(design$alpha_ind$Xr))),
+    a0_alpha_ind = extract_stan_array(m, "a0_alpha_ind",
+                                      c(N, ncol(design$alpha_ind$Xf))),
+    a_phi_ind = extract_stan_array(m, "a_phi_ind",
+                                   c(N, ncol(design$phi_ind$Xr))),
+    a0_phi_ind = extract_stan_array(m, "a0_phi_ind",
+                                    c(N, ncol(design$phi_ind$Xf))),
+    tau_s_alpha_ind = extract_stan_array(m, "tau_s_alpha_ind"),
+    tau_l_alpha_ind = extract_stan_array(m, "tau_l_alpha_ind"),
+    tau_s_phi_ind = extract_stan_array(m, "tau_s_phi_ind"),
+    tau_l_phi_ind = extract_stan_array(m, "tau_l_phi_ind"),
+    n_draws = nrow(m))
+}
+```
+
+```{r fn-reconstruct}
+# reconstruct_baseline(): interpretable parameters of a baseline AR(1) fit.
+#   components : output of extract_baseline_components()
+#   meta       : model metadata (person ids, time points, scaling)
+#   Returns, per posterior draw and on the 0-100 scale, the intercept alpha,
+#   AR coefficient phi, model-implied mean, innovation variance, local
+#   variance, and SD, at the population level and per person.
+reconstruct_baseline <- function(components, meta) {
+  D <- components$n_draws
+  N <- length(meta$ids)
+  center <- meta$scaling$center; scale <- meta$scaling$scale
+  u1 <- matrix(components$u[, , 1], D, N)
+  u2 <- matrix(components$u[, , 2], D, N)
+  u3 <- matrix(components$u[, , 3], D, N)
+  pop_phi <- FORMAL_CONFIG$phi_max * tanh(components$gamma[, 2])
+  ind_phi <- FORMAL_CONFIG$phi_max * tanh(sweep(u2, 1, components$gamma[, 2], "+"))
+  pop_alpha_z <- components$gamma[, 1]
+  ind_alpha_z <- sweep(u1, 1, components$gamma[, 1], "+")
+  # Population innovation variance marginalises over the person-level
+  # log-variance random effect (lognormal mean: exp(mu + tau^2/2)).
+  pop_innovation <- scale^2 * exp(components$gamma[, 3] +
+                                    0.5 * components$tau[, 3]^2)
+  ind_innovation <- scale^2 * exp(sweep(u3, 1, components$gamma[, 3], "+"))
+  pop_variance <- pop_innovation / (1 - pop_phi^2)
+  ind_variance <- ind_innovation / (1 - ind_phi^2)
+  list(
+    ids = meta$ids,
+    population = list(
+      alpha = center * (1 - pop_phi) + scale * pop_alpha_z,
+      phi = pop_phi,
+      mean = center + scale * pop_alpha_z / (1 - pop_phi),
+      innovation_variance = pop_innovation,
+      local_variance = pop_variance, sd = sqrt(pop_variance)),
+    individual = list(
+      alpha = center * (1 - ind_phi) + scale * ind_alpha_z,
+      phi = ind_phi,
+      mean = center + scale * ind_alpha_z / (1 - ind_phi),
+      innovation_variance = ind_innovation,
+      local_variance = ind_variance, sd = sqrt(ind_variance)))
+}
+
+# make_population_smooths(): population smooth curves of alpha and phi
+# (draws x time), assembled from the spline bases and their coefficients.
+make_population_smooths <- function(components, meta) {
+  design <- meta$design
+  list(alpha = components$a_alpha %*% t(design$alpha$Xr) +
+         components$a0_alpha %*% t(design$alpha$Xf),
+       phi = components$a_phi %*% t(design$phi$Xr) +
+         components$a0_phi %*% t(design$phi$Xf))
+}
+
+# reconstruct_tvar_population(): population time-varying parameters of a
+# TV-AR fit, per posterior draw and time point (same quantities as
+# reconstruct_baseline, now as draws x time matrices).
+reconstruct_tvar_population <- function(components, meta) {
+  D <- components$n_draws
+  Tnum <- length(meta$t_global)
+  center <- meta$scaling$center; scale <- meta$scaling$scale
+  smooth <- make_population_smooths(components, meta)
+  alpha_z <- sweep(smooth$alpha, 1, components$gamma[, 1], "+")
+  phi <- FORMAL_CONFIG$phi_max *
+    tanh(sweep(smooth$phi, 1, components$gamma[, 2], "+"))
+  innovation <- matrix(scale^2 * exp(components$gamma[, 3] +
+                                       0.5 * components$tau[, 3]^2), D, Tnum)
+  local <- innovation / (1 - phi^2)
+  list(alpha = center * (1 - phi) + scale * alpha_z, phi = phi,
+       mean = center + scale * alpha_z / (1 - phi),
+       innovation_variance = innovation, local_variance = local,
+       sd = sqrt(local), smooth = smooth)
+}
+
+# reconstruct_tvar_individual(): time-varying parameters of one person.
+#   person_index       : row index of the person in the fitted model
+#   population_smooths : output of make_population_smooths()
+reconstruct_tvar_individual <- function(components, meta, person_index,
+                                        population_smooths) {
+  D <- components$n_draws
+  Tnum <- length(meta$t_global)
+  design <- meta$design
+  center <- meta$scaling$center; scale <- meta$scaling$scale
+  coef_matrix <- function(x, k) matrix(x[, person_index, ], D, k)
+  alpha_ind <- coef_matrix(components$a_alpha_ind, ncol(design$alpha_ind$Xr)) %*%
+      t(design$alpha_ind$Xr) +
+    coef_matrix(components$a0_alpha_ind, ncol(design$alpha_ind$Xf)) %*%
+      t(design$alpha_ind$Xf)
+  phi_ind <- coef_matrix(components$a_phi_ind, ncol(design$phi_ind$Xr)) %*%
+      t(design$phi_ind$Xr) +
+    coef_matrix(components$a0_phi_ind, ncol(design$phi_ind$Xf)) %*%
+      t(design$phi_ind$Xf)
+  u <- matrix(components$u[, person_index, ], D, 3L)
+  alpha_z <- sweep(population_smooths$alpha + alpha_ind, 1,
+                   components$gamma[, 1] + u[, 1], "+")
+  phi <- FORMAL_CONFIG$phi_max *
+    tanh(sweep(population_smooths$phi + phi_ind, 1,
+               components$gamma[, 2] + u[, 2], "+"))
+  innovation <- matrix(scale^2 * exp(components$gamma[, 3] + u[, 3]), D, Tnum)
+  local <- innovation / (1 - phi^2)
+  list(alpha = center * (1 - phi) + scale * alpha_z, phi = phi,
+       mean = center + scale * alpha_z / (1 - phi),
+       innovation_variance = innovation, local_variance = local,
+       sd = sqrt(local))
+}
+```
+
+```{r baseline-params}
+# Population-average baseline parameters of both groups, on the 0-100 scale.
+baseline_population <- dplyr::bind_rows(lapply(c(0L, 1L), function(group) {
+  fit <- fits[[paste0(group_label(group), "_baseline")]]
+  reconstruction <- reconstruct_baseline(extract_baseline_components(fit),
+                                         fit$meta)
+  purrr::imap_dfr(reconstruction$population, function(draws, parameter) {
+    q <- posterior_summary(draws)
+    tibble::tibble(group_label = group_label(group), parameter = parameter,
+                   q2.5 = q[["q2.5"]], median = q[["median"]],
+                   q97.5 = q[["q97.5"]])
+  })
+}))
+baseline_population |>
+  dplyr::select(group = group_label, parameter, q2.5, median, q97.5) |>
+  kable(digits = 2,
+        caption = "Population-average parameter estimates for the baseline-phase data (0-100 scale).")
+```
+
+These baseline estimates serve as the reference points against which the
+intervention phase is compared in Step 4.
+
+# 5. Step 4: Effect size estimation and results
+
+The formal definitions of all effect size metrics are given in Table 2
+of the article. Every metric is computed per posterior draw, so each
+effect comes with a full posterior distribution and a 95% credible
+interval, and an effect is called credible when that interval excludes
+zero.
+
+## 5.1 Effect size functions
+
+The functions below implement the framework. The purpose, the arguments,
+and the return value of each function are documented in its header
+comment.
+
+```{r fn-effects}
+# The three primary effect metrics reported in the figures.
+PRIMARY_EFFECT_METRICS <- c("mean_standardized", "ar_difference",
+                            "local_variance_log_ratio")
+
+# build_effect_draws(): the effect metrics per posterior draw.
+#   baseline     : baseline parameter draws (population level or one person)
+#   intervention : intervention-phase draws at the same level
+#   Returns draws-by-time matrices of the standardized mean effect, the AR
+#   difference, and the local variance log ratio (plus the unstandardized
+#   mean and variance differences).
+build_effect_draws <- function(baseline, intervention) {
+  D <- nrow(intervention$mean); Tnum <- ncol(intervention$mean)
+  expand <- function(x) matrix(x, D, Tnum)
+  base_mean <- expand(baseline$mean); base_sd <- expand(baseline$sd)
+  base_phi <- expand(baseline$phi)
+  base_variance <- expand(baseline$local_variance)
+  list(
+    mean_raw_difference = intervention$mean - base_mean,
+    mean_standardized = (intervention$mean - base_mean) / base_sd,
+    ar_difference = intervention$phi - base_phi,
+    local_variance_raw_difference =
+      intervention$local_variance - base_variance,
+    local_variance_log_ratio =
+      log(intervention$local_variance / base_variance))
+}
+
+# summarise_named_vectors(): posterior median and 95% CrI for a list of
+# scalar parameter draws (one row per parameter).
+summarise_named_vectors <- function(x, level, group, phase, id = NA_integer_) {
+  purrr::imap_dfr(x, function(draws, parameter) {
+    q <- posterior_summary(draws)
+    tibble::tibble(level = level, id = id, group = group,
+                   group_label = group_label(group), phase = phase,
+                   parameter = parameter, q2.5 = q[["q2.5"]],
+                   median = q[["median"]], q97.5 = q[["q97.5"]])
+  })
+}
+
+# summarise_named_matrices(): posterior median and 95% CrI per time point
+# for a list of draws-by-time parameter matrices.
+summarise_named_matrices <- function(x, level, group, time, id = NA_integer_) {
+  purrr::imap_dfr(x, function(draws, parameter) {
+    summarise_draw_matrix(draws, time) |>
+      dplyr::mutate(level = level, id = id, group = group,
+                    group_label = group_label(group),
+                    parameter = parameter, .before = 1)
+  })
+}
+
+# summarise_effect_matrices(): time-specific effect summaries (posterior
+# median and 95% CrI per metric and time point).
+summarise_effect_matrices <- function(x, level, group, time, id = NA_integer_) {
+  purrr::imap_dfr(x, function(draws, metric) {
+    summarise_draw_matrix(draws, time) |>
+      dplyr::mutate(level = level, id = id, group = group,
+                    group_label = group_label(group), metric = metric,
+                    .before = 1)
+  })
+}
+
+# summarise_integrated_effects(): integrated effects. Each draw is averaged
+# over the phase first, then summarized; `credible_nonzero` flags whether
+# the 95% CrI excludes zero.
+summarise_integrated_effects <- function(x, level, group, id = NA_integer_) {
+  purrr::imap_dfr(x, function(draws, metric) {
+    q <- posterior_summary(rowMeans(draws))  # discrete 1/T integral
+    tibble::tibble(level = level, id = id, group = group,
+                   group_label = group_label(group), metric = metric,
+                   q2.5 = q[["q2.5"]], median = q[["median"]],
+                   q97.5 = q[["q97.5"]],
+                   credible_nonzero = q[["q2.5"]] * q[["q97.5"]] > 0)
+  })
+}
+
+effect_label <- function(x) {
+  dplyr::recode(x,
+    mean_standardized = "Standardized mean effect",
+    ar_difference = "AR coefficient difference",
+    local_variance_log_ratio = "Local variance log ratio", .default = x)
+}
+
+primary_effect_factor <- function(metric) {
+  factor(effect_label(metric), levels = effect_label(PRIMARY_EFFECT_METRICS))
+}
+```
+
+```{r fn-group-analysis}
+# run_group_posterior_analysis(): all within-group effect sizes of one group.
+#   baseline_fit / intervention_fit : outputs of fit_phase_model()
+#   group      : 0 = control, 1 = intervention
+#   tables_dir : folder for the CSV tables
+#   Computes the population-average and the individual-specific effects, both
+#   integrated and time-specific, writes them as tables, and returns the
+#   effect draws and summaries needed for the figures and for the
+#   between-group contrast.
+run_group_posterior_analysis <- function(baseline_fit, intervention_fit,
+                                         group, tables_dir) {
+  baseline_components <- extract_baseline_components(baseline_fit)
+  intervention_components <- extract_tvar_components(intervention_fit)
+  D <- min(baseline_components$n_draws, intervention_components$n_draws)
+  stopifnot(D == FORMAL_CONFIG$chains * FORMAL_CONFIG$iter_sampling)
+
+  # The two phase models were fitted independently; a seeded random
+  # permutation of one posterior makes the Monte Carlo pairing explicit.
+  set.seed(FORMAL_CONFIG$seed + 3000L + group)
+  order_post <- sample.int(D)
+  reorder_first <- function(x) {
+    dims <- dim(x)
+    if (is.null(dims)) return(x[order_post])
+    args <- c(list(x, order_post), rep(list(TRUE), length(dims) - 1L),
+              list(drop = FALSE))
+    do.call(`[`, args)
+  }
+  for (name in setdiff(names(intervention_components), "n_draws")) {
+    intervention_components[[name]] <- reorder_first(
+      intervention_components[[name]])
+  }
+
+  baseline <- reconstruct_baseline(baseline_components, baseline_fit$meta)
+  post_population <- reconstruct_tvar_population(intervention_components,
+                                                 intervention_fit$meta)
+  pop_smooth <- post_population$smooth
+  post_population$smooth <- NULL
+  time <- intervention_fit$meta$t_global
+  glabel <- group_label(group)
+
+  write_csv(summarise_named_vectors(baseline$population, "population",
+                                    group, "baseline"),
+            file.path(tables_dir, paste0(glabel, "_baseline_population.csv")))
+  write_csv(summarise_named_matrices(post_population, "population", group,
+                                     time),
+            file.path(tables_dir,
+                      paste0(glabel, "_intervention_population.csv")))
+
+  pop_effect_draws <- build_effect_draws(baseline$population, post_population)
+  write_csv(summarise_effect_matrices(pop_effect_draws, "population", group,
+                                      time),
+            file.path(tables_dir,
+                      paste0(glabel, "_population_time_effects.csv")))
+  pop_integrated <- summarise_integrated_effects(pop_effect_draws,
+                                                 "population", group)
+  write_csv(pop_integrated,
+            file.path(tables_dir,
+                      paste0(glabel, "_population_integrated_effects.csv")))
+
+  individual_integrated <- vector("list", length(baseline$ids))
+  for (i in seq_along(baseline$ids)) {
+    id <- baseline$ids[[i]]
+    post_i <- match(id, intervention_fit$meta$ids)
+    stopifnot(!is.na(post_i))
+    base_i <- lapply(baseline$individual, function(x) x[, i])
+    post_i_par <- reconstruct_tvar_individual(
+      intervention_components, intervention_fit$meta, post_i, pop_smooth)
+    individual_integrated[[i]] <- summarise_integrated_effects(
+      build_effect_draws(base_i, post_i_par), "individual", group, id)
+  }
+  individual_integrated <- dplyr::bind_rows(individual_integrated)
+  write_csv(individual_integrated,
+            file.path(tables_dir,
+                      paste0(glabel, "_individual_integrated_effects.csv")))
+
+  list(group = group,
+       population_effect_draws = pop_effect_draws,
+       population_time_effects = summarise_effect_matrices(
+         pop_effect_draws, "population", group, time),
+       population_integrated_effects = pop_integrated,
+       individual_integrated_effects = individual_integrated,
+       baseline_population = baseline$population,
+       post_population = post_population, time = time)
+}
+```
+
+```{r fn-between-group}
+# compute_between_group_effects(): between-group effect sizes.
+#   treatment / control : outputs of run_group_posterior_analysis()
+#   tables_dir          : folder for the CSV tables
+#   Subtracts the control group's within-group effect draws from the
+#   intervention group's draws (a difference-in-differences per posterior
+#   draw) and writes the time-specific and integrated summaries.
+compute_between_group_effects <- function(treatment, control, tables_dir) {
+  metrics <- names(treatment$population_effect_draws)
+  D <- nrow(treatment$population_effect_draws[[1]])
+  set.seed(FORMAL_CONFIG$seed + 9090L)
+  control_order <- sample.int(D)
+  draws <- purrr::set_names(lapply(metrics, function(metric) {
+    treatment$population_effect_draws[[metric]] -
+      control$population_effect_draws[[metric]][control_order, , drop = FALSE]
+  }), metrics)
+  time_summary <- purrr::imap_dfr(draws, function(x, metric) {
+    summarise_draw_matrix(x, treatment$time) |>
+      dplyr::mutate(level = "between_group", metric = metric, .before = 1)
+  })
+  integrated <- purrr::imap_dfr(draws, function(x, metric) {
+    q <- posterior_summary(rowMeans(x))
+    tibble::tibble(level = "between_group", metric = metric,
+                   q2.5 = q[["q2.5"]], median = q[["median"]],
+                   q97.5 = q[["q97.5"]],
+                   credible_nonzero = q[["q2.5"]] * q[["q97.5"]] > 0)
+  })
+  write_csv(time_summary, file.path(tables_dir, "between_group_time_effects.csv"))
+  write_csv(integrated,
+            file.path(tables_dir, "between_group_integrated_effects.csv"))
+  list(time = time_summary, integrated = integrated)
+}
+```
+
+The within-group effects of both groups are computed first. The control
+group's effects are needed for the between-group contrast in Section
+5.4.
+
+```{r run-effects, results='hide'}
+# Within-group effect sizes of both groups (the control group is needed
+# for the between-group contrast in Section 5.4).
+tables_dir <- "tables"
+results <- list(
+  control = run_group_posterior_analysis(
+    fits$control_baseline, fits$control_intervention, 0L, tables_dir),
+  treatment = run_group_posterior_analysis(
+    fits$treatment_baseline, fits$treatment_intervention, 1L, tables_dir))
+```
+
+```{r interp-helpers, include=FALSE}
+get_int <- function(res, m) {
+  dplyr::filter(res$population_integrated_effects, metric == m)
+}
+t_mean <- get_int(results$treatment, "mean_standardized")
+t_ar   <- get_int(results$treatment, "ar_difference")
+t_var  <- get_int(results$treatment, "local_variance_log_ratio")
+forest_counts <- function(res, m) {
+  x <- dplyr::filter(res$individual_integrated_effects, metric == m)
+  list(n = nrow(x),
+       pos = sum(x$credible_nonzero & x$median > 0),
+       neg = sum(x$credible_nonzero & x$median < 0))
+}
+fc_t <- forest_counts(results$treatment, "mean_standardized")
+```
+
+## 5.2 Population-average effect sizes for the intervention group
+
+The integrated effects, averaged over the intervention phase.
+
+```{r treatment-integrated}
+# Integrated population-average effects of the intervention group.
+results$treatment$population_integrated_effects |>
+  dplyr::filter(metric %in% PRIMARY_EFFECT_METRICS) |>
+  dplyr::select(metric, q2.5, median, q97.5, credible_nonzero) |>
+  kable(digits = 3,
+        caption = "Integrated population-average effects, intervention group.")
+```
+
+The time-varying effects.
+
+```{r fig-trajectories-fn}
+# plot_trajectories_1x3(): one row of three panels (mean, AR, variance) for
+# a set of time-varying effect summaries.
+#   data : time-specific effect summaries with columns `metric`, `time`,
+#          `q2.5`, `median`, `q97.5` (as written by the Step 4 functions)
+#   ylab : label of the vertical axis
+#   file : output PNG file
+#   Lines show posterior medians and ribbons the 95% CrI; the y-limits are
+#   padded so the zero line stays clear of the panel borders.
+plot_trajectories_1x3 <- function(data, ylab, file) {
+  d <- data |>
+    filter(metric %in% METRICS) |>
+    mutate(tp = tp_of(time),
+           panel = factor(panel_labels[metric], levels = panel_labels))
+  pad <- d |>
+    group_by(panel) |>
+    summarise(lo = min(q2.5, 0), hi = max(q97.5, 0), .groups = "drop") |>
+    mutate(margin = 0.15 * (hi - lo),
+           ymin = lo - margin, ymax = hi + margin) |>
+    tidyr::pivot_longer(c(ymin, ymax), values_to = "y") |>
+    mutate(tp = 1)
+  p <- ggplot(d, aes(tp, median)) +
+    geom_blank(data = pad, aes(tp, y)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey35",
+               linewidth = 0.45) +
+    geom_ribbon(aes(ymin = q2.5, ymax = q97.5), fill = "gray60",
+                alpha = 0.35) +
+    geom_line(color = "gray40", linewidth = 0.6) +
+    facet_wrap(~panel, ncol = 3, scales = "free_y") +
+    scale_x_continuous(breaks = TP_BREAKS, expand = expansion(mult = 0.02)) +
+    scale_y_continuous(expand = expansion(mult = 0.01)) +
+    labs(x = X_LAB, y = ylab) +
+    theme_paper(9)
+  dir.create(dirname(file), recursive = TRUE, showWarnings = FALSE)
+  ggsave(file, p, width = 9, height = 3.2, dpi = 320, bg = "white")
+}
+```
+
+```{r fig-population, results='hide'}
+# Population-average time-varying intervention effects, intervention group.
+plot_trajectories_1x3(
+  read.csv(file.path("tables",
+                     "treatment_population_time_effects.csv")),
+  "Standardized time-varying\nintervention effect",
+  file.path(FIG_DIR, "figure3.png"))
+```
+
+```{r population-show, echo=FALSE, out.width="100%"}
+knitr::include_graphics(file.path(FIG_DIR, "figure3.png"))
+```
+
+The integrated standardized mean effect is `r ci_text(t_mean)`,
+indicating no discernible shift in the mean level, and the time-varying
+trajectory (panel a) remains close to zero throughout. The integrated
+autoregressive effect is `r ci_text(t_ar)`, a credible reduction in
+inertia, and its trajectory (panel b) is credible from the start of the
+phase onward. The integrated variance effect is `r ci_text(t_var)`, and
+its trajectory (panel c) drifts downward gradually and becomes credible
+only in the later part of the phase. Such gradually emerging effects are
+invisible to any phase-averaged analysis.
+
+## 5.3 Individual-specific effect sizes for the intervention group
+
+The individual-level summaries are assembled first. The integrated
+effects come from the tables written by run_group_posterior_analysis()
+above, and the
+time-varying effects per person are computed once and cached.
+
+```{r fig-individual-time, results='hide'}
+# Individual-specific time-varying effects for the intervention group,
+# computed once and cached as a CSV; later runs load the cache.
+csv_path <- file.path(FIG_DIR, "treatment_individual_time_effects.csv")
+if (!file.exists(csv_path)) {
+  load_fit <- function(label) {
+    md <- file.path("models", label)
+    list(fit = readRDS(file.path(md, "fit_object.rds")),
+         meta = readRDS(file.path(md, "model_metadata.rds")))
+  }
+  tb <- load_fit("treatment_baseline")
+  ti <- load_fit("treatment_intervention")
+  bc <- extract_baseline_components(tb)
+  ic <- extract_tvar_components(ti)
+  D <- min(bc$n_draws, ic$n_draws)
+
+  # Identical Monte-Carlo pairing as run_group_posterior_analysis(group = 1)
+  set.seed(FORMAL_CONFIG$seed + 3000L + 1L)
+  order_post <- sample.int(D)
+  reorder_first <- function(x) {
+    dims <- dim(x)
+    if (is.null(dims)) return(x[order_post])
+    args <- c(list(x, order_post), rep(list(TRUE), length(dims) - 1L),
+              list(drop = FALSE))
+    do.call(`[`, args)
+  }
+  for (name in setdiff(names(ic), "n_draws")) ic[[name]] <- reorder_first(ic[[name]])
+
+  baseline <- reconstruct_baseline(bc, tb$meta)
+  pop <- reconstruct_tvar_population(ic, ti$meta)
+  pop_smooth <- pop$smooth
+  time <- ti$meta$t_global
+
+  rows <- vector("list", length(baseline$ids))
+  for (i in seq_along(baseline$ids)) {
+    id <- baseline$ids[[i]]
+    post_i <- match(id, ti$meta$ids)
+    base_i <- lapply(baseline$individual, function(x) x[, i])
+    post_par <- reconstruct_tvar_individual(ic, ti$meta, post_i, pop_smooth)
+    eff <- build_effect_draws(base_i, post_par)[METRICS]
+    rows[[i]] <- purrr::imap_dfr(eff, function(draws, metric) {
+      summarise_draw_matrix(draws, time) |>
+        mutate(id = id, metric = metric,
+               integrated_median = stats::median(rowMeans(draws)), .before = 1)
+    })
+  }
+  write_csv(bind_rows(rows), csv_path)
+}
+ind_time <- read.csv(csv_path)
+ind_int <- read.csv(file.path("tables",
+                              "treatment_individual_integrated_effects.csv")) |>
+  filter(metric %in% METRICS) |>
+  mutate(category = case_when(
+    !credible_nonzero ~ "ns", median > 0 ~ "pos", TRUE ~ "neg"))
+```
+
+The forest plots of the integrated effects.
+
+```{r fig-forest, results='hide'}
+# Individual-specific standardized integrated effects (forest plots).
+forest_data <- ind_int |>
+  mutate(panel = factor(panel_labels[metric], levels = panel_labels),
+         category = factor(category, levels = names(CAT_COLORS))) |>
+  group_by(panel) |>
+  arrange(desc(median), .by_group = TRUE) |>
+  mutate(rank = row_number()) |>
+  ungroup()
+forest_ann <- forest_data |>
+  count(panel, category, .drop = FALSE) |>
+  group_by(panel) |>
+  mutate(share = 100 * n / sum(n)) |>
+  summarise(label = paste(sprintf(
+    "%s: %d (%.0f%%)",
+    recode(as.character(category), neg = "Negative", pos = "Positive",
+           ns = "Near zero"), n, share), collapse = "\n"),
+    .groups = "drop")
+forest_breaks <- function(lims) {
+  if (diff(lims) > 2.5) seq(floor(lims[1]), ceiling(lims[2]), by = 1) else
+    scales::extended_breaks()(lims)
+}
+p_forest <- ggplot(forest_data, aes(median, rank)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey35",
+             linewidth = 0.45) +
+  geom_errorbarh(aes(xmin = q2.5, xmax = q97.5, color = category),
+                 height = 0, linewidth = 0.35, alpha = 0.8) +
+  geom_point(aes(color = category), size = 1.1) +
+  geom_label(data = forest_ann,
+             aes(x = Inf, y = Inf, label = label),
+             hjust = 1.02, vjust = -0.05, size = 2.6, lineheight = 1.1,
+             color = "black", fill = "white", alpha = 0.9, label.size = 0,
+             inherit.aes = FALSE) +
+  scale_color_manual(values = CAT_COLORS, labels = CAT_LABELS, drop = FALSE) +
+  scale_x_continuous(breaks = forest_breaks) +
+  scale_y_reverse(expand = expansion(mult = 0.02)) +
+  facet_wrap(~panel, ncol = 3, scales = "free_x") +
+  labs(x = "Standardized integrated intervention effect",
+       y = "Individuals (sorted by effect size)", color = NULL) +
+  theme_paper() +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        legend.box.spacing = unit(1, "pt"),
+        legend.margin = margin(0, 0, 0, 0))
+ggsave(file.path(FIG_DIR, "figure4.png"), p_forest, width = 6.5,
+       height = 6.2, dpi = 320, bg = "white")
+```
+
+```{r forest-show, echo=FALSE, out.width="100%"}
+knitr::include_graphics(file.path(FIG_DIR, "figure4.png"))
+```
+
+Each row is one person, sorted by effect size, with the integrated
+effect computed against the person's own baseline. On the standardized
+mean effect, `r fc_t$neg` of the `r fc_t$n` persons
+(`r sprintf("%.0f%%", 100 * fc_t$neg / fc_t$n)`) show a credible
+decrease in negative affect and `r fc_t$pos` show a credible increase.
+
+The individual-specific time-varying trajectories provide the most
+fine-grained view. The mean trajectories differ considerably across
+persons in both timing and shape, whereas the autoregressive and
+variance trajectories differ mainly in their overall magnitude.
+
+```{r fig-individual-grids, results='hide'}
+# Individual time-varying effects, one small panel per person, ordered by
+# the integrated effect and colored by the forest-plot category.
+# plot_individual_grid(): one small panel per person showing the time
+# course of one effect metric with its 95% CrI.
+#   metric : one of the three primary effect metrics
+#   ylab   : label of the vertical axis
+#   file   : output PNG file
+#   Panels are ordered by the integrated effect (largest first) and colored
+#   by the forest-plot category of the person.
+plot_individual_grid <- function(metric, ylab, file) {
+  cat_m <- ind_int |> filter(metric == !!metric)
+  d <- ind_time |>
+    filter(metric == !!metric) |>
+    mutate(tp = tp_of(time)) |>
+    left_join(cat_m[, c("id", "category")], by = "id")
+  ord <- d |> distinct(id, integrated_median) |>
+    arrange(desc(integrated_median))          # largest effect first
+  d <- d |> mutate(rank = factor(match(id, ord$id), levels = seq_len(nrow(ord))),
+                   category = factor(category, levels = names(CAT_COLORS)))
+  ylim <- c(stats::quantile(d$q2.5, 0.005), stats::quantile(d$q97.5, 0.995))
+  p <- ggplot(d, aes(tp, median)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey45",
+               linewidth = 0.25) +
+    geom_ribbon(aes(ymin = q2.5, ymax = q97.5, fill = category),
+                alpha = 0.3) +
+    geom_line(aes(color = category), linewidth = 0.35) +
+    facet_wrap(~rank, ncol = 10) +
+    coord_cartesian(ylim = ylim) +
+    scale_color_manual(values = CAT_COLORS, labels = CAT_LABELS,
+                       drop = TRUE, name = NULL) +
+    scale_fill_manual(values = CAT_COLORS, labels = CAT_LABELS,
+                      drop = TRUE, name = NULL) +
+    scale_x_continuous(breaks = c(1, 60, 120)) +
+    scale_y_continuous(breaks = scales::breaks_extended(4)) +
+    labs(x = X_LAB, y = ylab) +
+    guides(color = guide_legend(override.aes = list(linewidth = 0.9))) +
+    theme_paper(8) +
+    theme(strip.text = element_blank(),
+          axis.text = element_text(size = 4.2, color = "black"),
+          axis.ticks = element_line(color = "black", linewidth = 0.25),
+          axis.ticks.length = unit(1.5, "pt"),
+          panel.spacing = unit(4, "pt"),
+          panel.grid.major = element_blank(),
+          panel.border = element_rect(color = "grey30", fill = NA,
+                                      linewidth = 0.35),
+          legend.box.spacing = unit(1, "pt"),
+          legend.margin = margin(0, 0, 0, 0),
+          legend.text = element_text(size = 7))
+  dir.create(dirname(file), recursive = TRUE, showWarnings = FALSE)
+  ggsave(file, p, width = 6.5, height = 8.6, dpi = 320, bg = "white")
+}
+plot_individual_grid("mean_standardized",
+  "Individual-specific standardized time-varying mean intervention effect",
+  file.path(FIG_DIR, "figure5.png"))
+plot_individual_grid("ar_difference",
+  "Individual-specific standardized time-varying autoregressive intervention effect",
+  file.path(FIG_DIR, "figure_S1_individual_ar.png"))
+plot_individual_grid("local_variance_log_ratio",
+  "Individual-specific standardized time-varying variance intervention effect",
+  file.path(FIG_DIR, "figure_S2_individual_variance.png"))
+```
+
+```{r ind-mean-show, echo=FALSE, out.width="100%"}
+knitr::include_graphics(file.path(FIG_DIR, "figure5.png"))
+```
+
+```{r ind-ar-show, echo=FALSE, out.width="100%"}
+knitr::include_graphics(file.path(FIG_DIR, "figure_S1_individual_ar.png"))
+```
+
+```{r ind-var-show, echo=FALSE, out.width="100%"}
+knitr::include_graphics(file.path(FIG_DIR,
+                                  "figure_S2_individual_variance.png"))
+```
+
+These results highlight the importance of examining individual
+differences in intervention effects, which is essential for
+understanding for whom an intervention works.
+
+## 5.4 Between-group effect sizes
+
+The between-group effects subtract the control group's within-group
+effect draws from the intervention group's draws, which removes any
+change shared by both groups.
+
+```{r run-between, results='hide'}
+# Between-group effects: intervention minus control, per posterior draw.
+between <- compute_between_group_effects(results$treatment,
+                                         results$control, tables_dir)
+```
+
+```{r interp-between, include=FALSE}
+b_int <- function(m) dplyr::filter(between$integrated, metric == m)
+b_mean <- b_int("mean_standardized")
+b_ar   <- b_int("ar_difference")
+b_var  <- b_int("local_variance_log_ratio")
+```
+
+```{r between-table}
+# Integrated between-group effects.
+between$integrated |>
+  dplyr::filter(metric %in% PRIMARY_EFFECT_METRICS) |>
+  dplyr::select(metric, q2.5, median, q97.5, credible_nonzero) |>
+  kable(digits = 3,
+        caption = "Integrated between-group effects (intervention minus control).")
+```
+
+```{r fig-between, results='hide'}
+# Between-group time-varying effects (intervention minus control).
+plot_trajectories_1x3(
+  read.csv(file.path("tables",
+                     "between_group_time_effects.csv")),
+  "Between-group standardized\ntime-varying intervention effect",
+  file.path(FIG_DIR, "figure6.png"))
+```
+
+```{r between-show, echo=FALSE, out.width="100%"}
+knitr::include_graphics(file.path(FIG_DIR, "figure6.png"))
+```
+
+The integrated between-group effect on the mean is `r ci_text(b_mean)`,
+and its time-varying trajectory (panel a) never excludes zero. For
+inertia the integrated contrast is `r ci_text(b_ar)`, whose CrI
+`r cred_text(b_ar)`, yet the time-varying trajectory (panel b) is
+credibly negative in the second half of the intervention, an example of
+a time-specific effect that the integrated summary alone would miss. The
+clearest group difference emerges for variability, with an integrated
+effect of `r ci_text(b_var)` and a trajectory (panel c) that is credibly
+negative across essentially the entire phase.
+
